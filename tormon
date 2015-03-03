@@ -1,0 +1,183 @@
+#!/home/taylor/Envs/tormon/bin/python
+
+import os
+import optparse
+import feedparser
+import re
+import arrow
+import uuid
+import requests
+import logging
+
+
+__usage__='\nUsage: tormon -O /output/folder -u "http://rss.feed.example"'
+
+MAX_LOG_LINES = 1000
+MAX_ARCHIVED_ANIME = 300
+
+
+def load_list(filename):
+    try:
+        return filter(lambda x: x != '',
+                      map(lambda x: x.lower(),
+                          open(filename, 'r').read().split('\n')))
+    except IOError:
+        return []
+
+
+def strip_to_line_count(lines, limit):
+    if len(lines) > limit:
+        return lines[len(lines) - limit:]
+    return lines
+
+
+class Main(object):
+    '''
+    tormon checks an rss feed for new torrents. When it finds a new .torrent, to
+    downloads it to a specified output directory, where (presumably) a monitoring
+    torrent program will download the corresponding file.    
+    '''
+    def parse_options(self):
+        usage = 'usage: %prog [options]'+__usage__
+        parser = optparse.OptionParser(usage=usage)
+        parser.add_option(
+            '-O', '--output_dir', dest='output_dir', 
+            help='directory into which new torrents are saved',
+            default='/media/taylor/stuff/Anime/torrent-files',
+            metavar='DIR')
+        parser.add_option(
+            '-f', '--filetype', dest='filetype',
+            action='append',
+            default=['.torrent'],
+            help='admissible file types', 
+            metavar='TYPE')
+        parser.add_option(
+            '-d', '--downloaded_torrents', dest='downloaded_torrents',
+            default='/home/taylor/.downloaded_torrents',
+            help='log of already downloaded torrents', 
+            metavar='FILE')
+        parser.add_option(
+            '-l', '--log', dest='log',
+            help='log of tormons activity',
+            default='/home/taylor/.log',
+            metavar='FILE')
+        parser.add_option(
+            '-b', '--batch', dest='batch',
+            help='file containing list of rss feed urls', 
+            metavar='FILE')
+        parser.add_option(
+            '-u', '--url', dest='url',
+            action='append',
+            default=[],
+            help='url of the rss feed', 
+            metavar='URL')
+        parser.add_option(
+            '-e', '--error_log', dest='error_log',
+            default='/home/taylor/.error_log',
+            help='destination of the error_log',
+            metavar='FILE')
+        parser.add_option(
+            '-W', '--watch-list', dest='watch_list',
+            action='append',
+            default=os.path.expanduser('~/.watch_list'),
+            help='the file listing currently watching shows',
+            metavar='FILE')
+        parser.add_option(
+            '-m','--mark_all_downloaded', dest='mark_all_downloaded',
+            action='store_true', 
+            default=False,
+            help="mark all torrents as already downloaded")
+        parser.add_option(
+            '-M','--match_by_filename', dest='match_by_filename',
+            action='store_true', 
+            default=False,
+            help="recognize downloaded files by filename, not URL. Matching by URL is the default.")        
+        (self.opt, args) = parser.parse_args()
+        if self.opt.batch:
+            for line in open(self.opt.batch, 'r'):
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    self.opt.url.append(line)
+        try:
+            os.makedirs(self.opt.output_dir)
+        except Exception:
+            pass
+        if len(self.opt.url) <= 0:
+            logging.error(__usage__)
+            logging.error("User must pass a valid RSS feed")
+            exit(1)
+        logging.basicConfig(filename=self.opt.log, level=logging.DEBUG)
+        self.shows = load_list(self.opt.watch_list)
+        self.downloaded = load_list(self.opt.downloaded_torrents)
+        self.errors = load_list(self.opt.error_log)
+
+    def update_downloaded(self, url):
+        self.downloaded.append(url)
+        try:
+            self.errors.remove(url)
+        except ValueError:
+            pass
+
+    def clear_logs(self):
+        self.downloaded = strip_to_line_count(self.downloaded, MAX_ARCHIVED_ANIME)
+        self.errors = strip_to_line_count(self.errors, MAX_ARCHIVED_ANIME)
+
+    def download_torrent(self, url):
+        req = requests.get(url)
+        filename = self.url2filename(url)
+        target_file = os.path.join(self.opt.output_dir, filename + ".torrent")
+        logging.info('Downloading to: %s', target_file)
+        with open(target_file, 'w+') as f:
+            f.write(req.content)
+        self.update_downloaded(url)
+
+    def url2filename(self, url):
+        return str(uuid.uuid4())
+
+    def has_been_downloaded(self, url):
+        if self.opt.match_by_filename:
+            filename = self.url2filename(url)
+            return (filename in [self.url2filename(link) for link in self.downloaded])
+        else:
+            return (url in self.downloaded)
+
+    def parse_rss_feed(self):
+        for url in self.opt.url:
+            logging.info(arrow.utcnow().to('US/Pacific').format('YYYY-MM-DD HH:mm:ss'))
+            parsed = feedparser.parse(url)
+            new_count = 0
+            for entry in parsed.entries:
+                if not self.has_been_downloaded(entry.link)\
+                    and self.check_title(entry.title):
+                    new_count += 1
+                    if self.opt.mark_all_downloaded:
+                        logging.info('Marking %s as downloaded', entry.link)
+                        self.update_downloaded(entry.link)
+                    else:
+                        logging.info('Downloading Episode of %s', entry.title)
+                        self.download_torrent(entry.link)
+            logging.info('Torrent total: %s', new_count)
+
+    def check_title(self, title):
+        m = re.search('^.*\[.+\](.+) \- [0-9]+.*$', title)
+        ans = m and m.group(1).lstrip().rstrip()
+        return ans and ans.lower() in self.shows
+
+    def save_list_of_already_downloaded_torrents(self):
+        with open(self.opt.downloaded_torrents, 'w+') as f:
+            f.write('\n'.join(self.downloaded))
+        with open(self.opt.error_log, 'w+') as f:
+            f.write('\n'.join(self.errors))
+
+    def __init__(self):
+        self.parse_options()
+        try:
+            self.parse_rss_feed()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.clear_logs()
+            self.save_list_of_already_downloaded_torrents()
+
+if __name__ == '__main__':
+    Main()
